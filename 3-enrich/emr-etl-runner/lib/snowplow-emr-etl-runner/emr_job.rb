@@ -356,7 +356,7 @@ module Snowplow
             "Shred Enriched Events",
             assets[:shred],
             "enrich.hadoop.ShredJob",
-            { :in          => enrich_step_output,
+            { :in          => self.class.glob_path(enrich_step_output),
               :good        => shred_step_output,
               :bad         => self.class.partition_by_run(csbs[:bad],    run_id),
               :errors      => self.class.partition_by_run(csbs[:errors], run_id, config[:enrich][:continue_on_unexpected_error])
@@ -748,6 +748,16 @@ module Snowplow
         else
           codec = compression_format.downcase
           codec == "gzip" ? "gz" : codec
+        end
+      end
+
+      # Adds a match all glob to the end of the path
+      Contract String => String
+      def self.glob_path(path)
+        if path.end_with?("/*")
+          path
+        else
+          "#{path}/*"
         end
       end
 
