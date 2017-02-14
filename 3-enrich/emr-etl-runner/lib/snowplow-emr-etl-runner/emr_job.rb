@@ -67,6 +67,7 @@ module Snowplow
       @@failed_states  = Set.new(%w(FAILED CANCELLED))
 
       include Monitoring::Logging
+      include Snowplow::EmrEtlRunner::Utils
 
       # Initializes our wrapper for the Amazon EMR client.
       Contract Bool, Bool, Bool, Bool, Bool, ConfigHash, ArrayOf[String], String => EmrJob
@@ -75,26 +76,27 @@ module Snowplow
         logger.debug "Initializing EMR jobflow"
 
         # Configuration
-        custom_assets_bucket = self.class.get_hosted_assets_bucket(config[:aws][:s3][:buckets][:assets], config[:aws][:emr][:region])
-        assets = self.class.get_assets(
+        custom_assets_bucket =
+          get_hosted_assets_bucket(STANDARD_HOSTED_ASSETS, config[:aws][:s3][:buckets][:assets], config[:aws][:emr][:region])
+        assets = get_assets(
           custom_assets_bucket,
           config[:enrich][:versions][:hadoop_enrich],
           config[:enrich][:versions][:hadoop_shred],
           config[:enrich][:versions][:hadoop_elasticsearch])
 
+        collector_format = config[:collectors][:format]
         run_tstamp = Time.new
         run_id = run_tstamp.strftime("%Y-%m-%d-%H-%M-%S")
         @run_id = run_id
         etl_tstamp = (run_tstamp.to_f * 1000).to_i.to_s
-        output_codec = self.class.output_codec_from_compression_format(config[:enrich][:output_compression])
-        output_codec_argument = output_codec == 'none' ? [] : ["--outputCodec" , output_codec]
+        output_codec = output_codec_from_compression_format(config[:enrich][:output_compression])
         s3 = Sluice::Storage::S3::new_fog_s3_from(
           config[:aws][:s3][:region],
           config[:aws][:access_key_id],
           config[:aws][:secret_access_key])
 
         # Check whether there are an even number of .lzo and .lzo.index files
-        if config[:collectors][:format] == 'thrift'
+        if collector_format == 'thrift'
           processing_location = Sluice::Storage::S3::Location.new(config[:aws][:s3][:buckets][:raw][:processing])
           processing_file_count = Sluice::Storage::S3.list_files(s3, processing_location).size
           unless processing_file_count % 2 == 0
@@ -142,7 +144,7 @@ module Snowplow
         @jobflow.master_instance_type = config[:aws][:emr][:jobflow][:master_instance_type]
         @jobflow.slave_instance_type  = config[:aws][:emr][:jobflow][:core_instance_type]
 
-        if config[:collectors][:format] == 'thrift'
+        if collector_format == 'thrift'
           if @legacy
             [
               Elasticity::HadoopBootstrapAction.new('-c', 'io.file.buffer.size=65536'),
@@ -164,14 +166,15 @@ module Snowplow
         end
 
         # Prepare a bootstrap action based on the AMI version
-        standard_assets_bucket = self.class.get_hosted_assets_bucket(STANDARD_HOSTED_ASSETS, config[:aws][:emr][:region])
-        bootstrap_jar_location = if @legacy
+        standard_assets_bucket =
+          get_hosted_assets_bucket(STANDARD_HOSTED_ASSETS, STANDARD_HOSTED_ASSETS, config[:aws][:emr][:region])
+        bootstrap_script_location = if @legacy
           "#{standard_assets_bucket}common/emr/snowplow-ami3-bootstrap-0.1.0.sh"
         else
           "#{standard_assets_bucket}common/emr/snowplow-ami4-bootstrap-0.2.0.sh"
         end
         cc_version = get_cc_version(config[:enrich][:versions][:hadoop_enrich])
-        @jobflow.add_bootstrap_action(Elasticity::BootstrapAction.new(bootstrap_jar_location, cc_version))
+        @jobflow.add_bootstrap_action(Elasticity::BootstrapAction.new(bootstrap_script_location, cc_version))
 
         # Install and launch HBase
         hbase = config[:aws][:emr][:software][:hbase]
@@ -192,10 +195,6 @@ module Snowplow
           @jobflow.add_bootstrap_action(install_lingual_action)
         end
 
-        # For serialization debugging. TODO doesn't work yet
-        # install_ser_debug_action = Elasticity::BootstrapAction.new("#{STANDARD_HOSTED_ASSETS}/common/emr/cascading-ser-debug.sh")
-        # @jobflow.add_bootstrap_action(install_ser_debug_action)
-
         # Now let's add our task group if required
         tic = config[:aws][:emr][:jobflow][:task_instance_count]
         if tic > 0
@@ -214,12 +213,12 @@ module Snowplow
           @jobflow.set_task_instance_group(instance_group)
         end
 
-        s3_endpoint = self.class.get_s3_endpoint(config[:aws][:s3][:region])
+        s3_endpoint = get_s3_endpoint(config[:aws][:s3][:region])
         csbr = config[:aws][:s3][:buckets][:raw]
         csbe = config[:aws][:s3][:buckets][:enriched]
 
         enrich_final_output = if enrich
-          self.class.partition_by_run(csbe[:good], run_id)
+          partition_by_run(csbe[:good], run_id)
         else
           csbe[:good] # Doesn't make sense to partition if enrich has already been done
         end
@@ -234,11 +233,7 @@ module Snowplow
           # 1. Compaction to HDFS (if applicable)
           raw_input = csbr[:processing]
 
-          is_supported_collector_format = self.class.is_cloudfront_log(config[:collectors][:format]) ||
-                                          config[:collectors][:format] == "thrift" ||
-                                          self.class.is_ua_ndjson(config[:collectors][:format])
-
-          to_hdfs = is_supported_collector_format && s3distcp
+          to_hdfs = is_supported_collector_format(collector_format) && s3distcp
 
           # TODO: throw exception if processing thrift with --skip s3distcp
           # https://github.com/snowplow/snowplow/issues/1648
@@ -252,7 +247,7 @@ module Snowplow
           if to_hdfs
 
             # for ndjson/urbanairship we can group by everything, just aim for the target size
-            group_by = self.class.is_ua_ndjson(config[:collectors][:format]) ? ".*(urbanairship).*" : ".*\\.([0-9]+-[0-9]+-[0-9]+)-[0-9]+\\..*"
+            group_by = is_ua_ndjson(collector_format) ? ".*(urbanairship).*" : ".*\\.([0-9]+-[0-9]+-[0-9]+)-[0-9]+\\..*"
 
             # Create the Hadoop MR step for the file crushing
             compact_to_hdfs_step = Elasticity::S3DistCpStep.new(legacy = @legacy)
@@ -265,7 +260,7 @@ module Snowplow
                 "--targetSize"  , "128",
                 "--outputCodec" , "lzo"
               ].select { |el|
-                self.class.is_cloudfront_log(config[:collectors][:format]) || self.class.is_ua_ndjson(config[:collectors][:format])
+                is_cloudfront_log(collector_format) || is_ua_ndjson(collector_format)
               }
             compact_to_hdfs_step.name << ": Raw S3 -> HDFS"
 
@@ -286,13 +281,13 @@ module Snowplow
             "enrich.hadoop.EtlJob",
             { :in     => enrich_step_input,
               :good   => enrich_step_output,
-              :bad    => self.class.partition_by_run(csbe[:bad],    run_id),
-              :errors => self.class.partition_by_run(csbe[:errors], run_id, config[:enrich][:continue_on_unexpected_error])
+              :bad    => partition_by_run(csbe[:bad],    run_id),
+              :errors => partition_by_run(csbe[:errors], run_id, config[:enrich][:continue_on_unexpected_error])
             },
-            { :input_format     => config[:collectors][:format],
+            { :input_format     => collector_format,
               :etl_tstamp       => etl_tstamp,
-              :iglu_config      => self.class.build_iglu_config_json(resolver),
-              :enrichments      => self.class.build_enrichments_json(enrichments_array)
+              :iglu_config      => Base64.strict_encode64(resolver),
+              :enrichments      => build_enrichments_json(enrichments_array)
             }
           )
 
@@ -311,7 +306,7 @@ module Snowplow
               "--dest"       , enrich_final_output,
               "--srcPattern" , PARTFILE_REGEXP,
               "--s3Endpoint" , s3_endpoint
-            ] + output_codec_argument
+            ] + output_codec
             copy_to_s3_step.name << ": Enriched HDFS -> S3"
             @jobflow.add_step(copy_to_s3_step)
 
@@ -332,7 +327,7 @@ module Snowplow
 
           # 3. Shredding
           csbs = config[:aws][:s3][:buckets][:shredded]
-          shred_final_output = self.class.partition_by_run(csbs[:good], run_id)
+          shred_final_output = partition_by_run(csbs[:good], run_id)
           shred_step_output = if s3distcp
             "hdfs:///local/snowplow/shredded-events/"
           else
@@ -356,13 +351,13 @@ module Snowplow
             "Shred Enriched Events",
             assets[:shred],
             "enrich.hadoop.ShredJob",
-            { :in          => self.class.glob_path(enrich_step_output),
+            { :in          => glob_path(enrich_step_output),
               :good        => shred_step_output,
-              :bad         => self.class.partition_by_run(csbs[:bad],    run_id),
-              :errors      => self.class.partition_by_run(csbs[:errors], run_id, config[:enrich][:continue_on_unexpected_error])
+              :bad         => partition_by_run(csbs[:bad], run_id),
+              :errors      => partition_by_run(csbs[:errors], run_id, config[:enrich][:continue_on_unexpected_error])
             },
             {
-              :iglu_config => self.class.build_iglu_config_json(resolver)
+              :iglu_config => Base64.strict_encode64(resolver)
             }
           )
 
@@ -381,7 +376,7 @@ module Snowplow
               "--dest"       , shred_final_output,
               "--srcPattern" , PARTFILE_REGEXP,
               "--s3Endpoint" , s3_endpoint
-            ] + output_codec_argument
+            ] + output_codec
             copy_to_s3_step.name << ": Shredded HDFS -> S3"
             @jobflow.add_step(copy_to_s3_step)
           end
@@ -404,8 +399,8 @@ module Snowplow
 
         # The default sources are the enriched and shredded errors generated for this run
         default_sources = []
-        default_sources << self.class.partition_by_run(config[:aws][:s3][:buckets][:enriched][:bad], @run_id) if enrich
-        default_sources << self.class.partition_by_run(config[:aws][:s3][:buckets][:shredded][:bad], @run_id) if shred
+        default_sources << partition_by_run(config[:aws][:s3][:buckets][:enriched][:bad], @run_id) if enrich
+        default_sources << partition_by_run(config[:aws][:s3][:buckets][:shredded][:bad], @run_id) if shred
 
         steps = elasticsearch_targets.flat_map { |target|
 
@@ -508,19 +503,6 @@ module Snowplow
         scalding_step.name << ": #{step_name}"
 
         scalding_step
-      end
-
-      # Get commons-codec version required by Scala Hadoop Enrich
-      # for further replace
-      # See: https://github.com/snowplow/snowplow/issues/2735
-      Contract String => String
-      def get_cc_version(she_version)
-        she_version_normalized = Gem::Version.new(she_version)
-        if she_version_normalized > Gem::Version.new("1.8.0")
-          "1.10"
-        else
-          "1.5"
-        end
       end
 
       # Wait for a jobflow.
@@ -654,111 +636,11 @@ module Snowplow
         end
       end
 
-      # Does this collector format represent CloudFront
-      # access logs?
-      Contract String => Bool
-      def self.is_cloudfront_log(collector_format)
-        (collector_format == "cloudfront" or collector_format.start_with?("tsv/com.amazon.aws.cloudfront/"))
-      end
-
-      # Does this collector format represent ndjson/urbanairship ?
-      Contract String => Bool
-      def self.is_ua_ndjson(collector_format)
-        /^ndjson\/com\.urbanairship\.connect\/.+$/ === collector_format
-      end
-
-      # We need to partition our output buckets by run ID
-      # Note buckets already have trailing slashes
-      #
-      # Parameters:
-      # +folder+:: the folder to append a run ID folder to
-      # +run_id+:: the run ID to append
-      # +retain+:: set to false if this folder should be nillified
-      #
-      # Return the folder with a run ID folder appended
-      Contract Maybe[String], String, Bool => Maybe[String]
-      def self.partition_by_run(folder, run_id, retain=true)
-        "#{folder}run=#{run_id}/" if retain
-      end
-
-      # Returns a base64-encoded JSON containing an array of enrichment JSONs
-      Contract ArrayOf[String] => String
-      def self.build_enrichments_json(enrichments_array)
-        enrichments_json_data = enrichments_array.map {|e| JSON.parse(e)}
-        enrichments_json = {
-          'schema' => 'iglu:com.snowplowanalytics.snowplow/enrichments/jsonschema/1-0-0',
-          'data'   => enrichments_json_data
-        }
-
-        Base64.strict_encode64(enrichments_json.to_json)
-      end
-
-      Contract String => String
-      def self.build_iglu_config_json(resolver)
-        Base64.strict_encode64(resolver)
-      end
-
-      # Builds the region-appropriate bucket name for Snowplow's
-      # hosted assets. Has to be region-specific because of
-      # https://github.com/boto/botocore/issues/424
-      #
-      # Parameters:
-      # +bucket+:: the specified hosted assets bucket
-      # +region+:: the AWS region to source hosted assets from
-      Contract String, String => String
-      def self.get_hosted_assets_bucket(bucket, region)
-        bucket = bucket.chomp('/')
-        suffix = if !bucket.eql? STANDARD_HOSTED_ASSETS or region.eql? "eu-west-1" then "" else "-#{region}" end
-        "#{bucket}#{suffix}/"
-      end
-
-      Contract String, String, String, String => AssetsHash
-      def self.get_assets(assets_bucket, hadoop_enrich_version, hadoop_shred_version, hadoop_elasticsearch_version)
-        enrich_path_middle = hadoop_enrich_version[0] == '0' ? 'hadoop-etl/snowplow-hadoop-etl' : 'scala-hadoop-enrich/snowplow-hadoop-enrich'
-        {
-          :enrich   => "#{assets_bucket}3-enrich/#{enrich_path_middle}-#{hadoop_enrich_version}.jar",
-          :shred    => "#{assets_bucket}3-enrich/scala-hadoop-shred/snowplow-hadoop-shred-#{hadoop_shred_version}.jar",
-          :elasticsearch => "#{assets_bucket}4-storage/hadoop-elasticsearch-sink/hadoop-elasticsearch-sink-#{hadoop_elasticsearch_version}.jar",
-        }
-      end
-
-      # Returns the S3 endpoint for a given
-      # S3 region
-      Contract String => String
-      def self.get_s3_endpoint(s3_region)
-        if s3_region == "us-east-1"
-          "s3.amazonaws.com"
-        else
-          "s3-#{s3_region}.amazonaws.com"
-        end
-      end
-
       # Returns true if the jobflow seems to have failed due to a bootstrap failure
       Contract Elasticity::JobFlow => Bool
       def self.bootstrap_failure?(jobflow)
         jobflow.cluster_step_status.all? {|s| s.state == 'CANCELLED'} &&
         (! (jobflow.cluster_status.last_state_change_reason =~ BOOTSTRAP_FAILURE_INDICATOR).nil?)
-      end
-
-      # Converts the output_compression configuration field to
-      Contract Maybe[String] => String
-      def self.output_codec_from_compression_format(compression_format)
-        if compression_format.nil?
-          "none"
-        else
-          codec = compression_format.downcase
-          codec == "gzip" ? "gz" : codec
-        end
-      end
-
-      # Adds a match all glob to the end of the path
-      Contract String => String
-      def self.glob_path(path)
-        if path.end_with?("/*")
-          path
-        else
-          "#{path}/*"
-        end
       end
 
     end

@@ -34,9 +34,26 @@ fatal = runner::Monitoring::Logging.method(:fatal_with)
 # Note that each step is only actioned if the previous step succeeded without error.
 begin
 
-  args, config, enrichments, resolver = runner::Cli.get_args_config_enrichments_resolver()
-  r = runner::Runner.new(args, config, enrichments, resolver)
-  r.run()
+  cmd, args, config, enrichments, resolver = runner::Cli.get_args_config_enrichments_resolver()
+
+  if cmd == 'run'
+    r = runner::Runner.new(args, config, enrichments, resolver)
+    r.run()
+  else
+    version = args[:schema_version].nil? ? '1-0-0' : args[:schema_version]
+    if cmd == 'generate emr-cluster'
+      filename = args[:filename].nil? ? 'cluster.json' : args[:filename]
+      runner::EmrClusterGenerator.new.generate(config, version, filename)
+      puts "Generated #{filename}"
+    else
+      debug = args[:debug]
+      skip = args[:skip]
+      filename = args[:filename].nil? ? 'playbook.json' : args[:filename]
+      runner::PlaybookGenerator.new
+        .generate(config, version, filename, debug, skip, resolver, enrichments)
+      puts "Generated #{filename}"
+    end
+  end
 
 # Don't print stack trace for configuration errors
 rescue runner::ConfigError => e
