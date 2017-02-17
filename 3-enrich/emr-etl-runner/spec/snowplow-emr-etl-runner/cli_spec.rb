@@ -76,7 +76,7 @@ describe Cli do
       ]
     }
 
-    Cli.recursive_symbolize_keys(raw).should == {
+    expect(Cli.recursive_symbolize_keys(raw)).to eq({
       :s3 => {
         :buckets => {
           :raw => {
@@ -101,7 +101,7 @@ describe Cli do
           :port => 1234
         }
       ]
-    }
+    })
 
   end
 
